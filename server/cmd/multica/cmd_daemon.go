@@ -595,6 +595,13 @@ func printDaemonStatusReport(w io.Writer, label string, health map[string]any) {
 	if ws, ok := health["workspaces"].([]any); ok {
 		rows = append(rows, row{"Workspaces", strconv.Itoa(len(ws))})
 	}
+	// Surface backend connectivity as a row so it aligns with the rest of
+	// the report. Older daemons (or daemons in an "unknown" state because no
+	// ServerBaseURL is configured) won't include this field — skip in that
+	// case so existing output stays unchanged for them.
+	if conn, ok := health["backend_connectivity"].(string); ok && conn != "" && conn != "unknown" {
+		rows = append(rows, row{"Backend", conn})
+	}
 
 	keyWidth := 0
 	for _, r := range rows {

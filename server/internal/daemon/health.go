@@ -25,11 +25,54 @@ type HealthResponse struct {
 	ActiveTaskCount int64             `json:"active_task_count"`
 	Agents          []string          `json:"agents"`
 	Workspaces      []healthWorkspace `json:"workspaces"`
+	// BackendConnectivity reports whether the daemon can reach its
+	// configured ServerBaseURL. One of "connected" | "unreachable" | "unknown".
+	// Useful for distinguishing "daemon process is running but cannot poll"
+	// from "daemon process is fully up", which otherwise looks identical to
+	// `multica daemon status` callers.
+	BackendConnectivity string `json:"backend_connectivity,omitempty"`
 }
 
 type healthWorkspace struct {
 	ID       string   `json:"id"`
 	Runtimes []string `json:"runtimes"`
+}
+
+// probeBackendConnectivity does a short-timeout GET against the daemon's
+// configured ServerBaseURL's /health endpoint to determine whether the
+// daemon can currently reach the Multica server. Returns one of:
+//   - "connected"    — server responded with 2xx
+//   - "unreachable"  — request failed (connection refused, DNS, TLS, timeout, non-2xx)
+//   - "unknown"      — daemon has no ServerBaseURL configured
+//
+// The probe carries its own 1500ms timeout so callers don't need to thread
+// one in. The parent context still applies — if it's cancelled or has a
+// shorter deadline, the request honors that. Synchronous in the hot path of
+// `multica daemon status`; in the failure case it adds at most ~1.5s of
+// latency, which is acceptable for an ergonomic / observability addition.
+// If callers find this too costly under load, a follow-up can move the
+// probe to a background goroutine that updates a cached value every N
+// seconds.
+func probeBackendConnectivity(parent context.Context, serverURL string) string {
+	if serverURL == "" {
+		return "unknown"
+	}
+	ctx, cancel := context.WithTimeout(parent, 1500*time.Millisecond)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, serverURL+"/health", nil)
+	if err != nil {
+		return "unreachable"
+	}
+	httpClient := &http.Client{Timeout: 1500 * time.Millisecond}
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return "unreachable"
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		return "connected"
+	}
+	return "unreachable"
 }
 
 // listenHealth binds the health port. Returns the listener or an error if
@@ -73,16 +116,17 @@ func (d *Daemon) healthHandler(startedAt time.Time) http.HandlerFunc {
 		}
 
 		resp := HealthResponse{
-			Status:          "running",
-			PID:             os.Getpid(),
-			Uptime:          time.Since(startedAt).Truncate(time.Second).String(),
-			DaemonID:        d.cfg.DaemonID,
-			DeviceName:      d.cfg.DeviceName,
-			ServerURL:       d.cfg.ServerBaseURL,
-			CLIVersion:      d.cfg.CLIVersion,
-			ActiveTaskCount: d.activeTasks.Load(),
-			Agents:          agents,
-			Workspaces:      wsList,
+			Status:              "running",
+			PID:                 os.Getpid(),
+			Uptime:              time.Since(startedAt).Truncate(time.Second).String(),
+			DaemonID:            d.cfg.DaemonID,
+			DeviceName:          d.cfg.DeviceName,
+			ServerURL:           d.cfg.ServerBaseURL,
+			CLIVersion:          d.cfg.CLIVersion,
+			ActiveTaskCount:     d.activeTasks.Load(),
+			Agents:              agents,
+			Workspaces:          wsList,
+			BackendConnectivity: probeBackendConnectivity(r.Context(), d.cfg.ServerBaseURL),
 		}
 
 		w.Header().Set("Content-Type", "application/json")
